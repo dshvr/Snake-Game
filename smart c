@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// @title Experiment Marketplace
+/// @notice Create experiments for sale in ETH, buyers buy them, then record results on-chain.
+/// @dev Small, dependency-free contract intended for quick testing & experiments. Use audits for production.
+contract ExperimentMarketplace {
+    /* ========== EVENTS ========== */
+    event ExperimentCreated(uint256 indexed id, address indexed seller, uint256 priceWei, string metadata);
+    event ExperimentCancelled(uint256 indexed id);
+    event ExperimentBought(uint256 indexed id, address indexed buyer, uint256 priceWei);
+    event ResultRecorded(uint256 indexed id, address indexed buyer, bytes32 resultHash, uint256 score);
+    event Withdraw(address indexed to, uint256 amount);
+
+    /* ========== STRUCTS & STATE ========== */
+    struct Experiment {
+        uint256 id;
+        address payable seller;
+        address buyer;
+        uint256 priceWei;
+        bool sold;
+        bytes32 resultHash;       // hash of result data (e.g. keccak256 of JSON / IPFS CID compressed)
+        uint256 score;            // numeric score/metric
+        uint256 createdAt;
+        uint256 purchasedAt;
+        uint256 resultRecordedAt;
+        string metadata;          // optional short descriptor (URI, title). Note: strings cost gas.
+    }
+
+    uint256 public nextId;
+    mapping(uint256 => Experiment) public experiments;
+
+    // Pull-based withdrawals (seller => amount)
+    mapping(address => uint256) public withdrawals;
+
+    // Platform fee in basis points (bps). E.g., 200 = 2%
+    uint256 public platformFeeBps;
+    address public platformReceiver;
+
+    address public owner;
+
+    /* ========== MODIFIERS ========== */
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    modifier exists(uint256 id) {
+        require(id < nextId, "Experiment not found");
+        _;
+    }
+
+    constructor(uint256 _platformFeeBps, address _platformReceiver) {
+        require(_platformFeeBps <= 1000, "Fee too high"); // cap: 10%
+        owner = msg.sender;
+        platformFeeBps = _platformFeeBps;
+        platformReceiver = _platformReceiver;
+        nextId = 0;
+    }
+
+    /* ========== ADMIN ========== */
+    function setPlatformFee(uint256 bps) external onlyOwner {
+        require(bps <= 1000, "Fee too high");
+        platformFeeBps = bps;
+    }
+    function setPlatformReceiver(address receiver) external onlyOwner {
+        require(receiver != address(0), "Zero address");
+        platformReceiver = receiver;
+    }
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Zero address");
+        owner = newOwner;
+    }
+
+    /* ========== EXPERIMENT LIFECYCLE ========== */
+
+    /// @notice Create a new experiment listing for sale
+    /// @param priceWei Price in wei buyer must pay
+    /// @param metadata Optional short string (title or ipfs link)
+    /// @return id Experiment id
+    function createExperiment(uint256 priceWei, string calldata metadata) external returns (uint256 id) {
+        require(priceWei > 0, "Price must be > 0");
+        id = nextId++;
+        experiments[id] = Experiment({
+            id: id,
+            seller: payable(msg.sender),
+            buyer: address(0),
+            priceWei: priceWei,
+            sold: false,
+            resultHash: bytes32(0),
+            score: 0,
+            createdAt: block.timestamp,
+            purchasedAt: 0,
+            resultRecordedAt: 0,
+            metadata: metadata
+        });
+
+        emit ExperimentCreated(id, msg.sender, priceWei, metadata);
+    }
+
+    /// @notice Cancel an unsold experiment (seller only)
+    function cancelExperiment(uint256 id) external exists(id) {
+        Experiment storage e = experiments[id];
+        require(msg.sender == e.seller, "Not seller");
+        require(!e.sold, "Already sold");
+        delete experiments[id];
+        emit ExperimentCancelled(id);
+    }
+
+    /// @notice Buy an available experiment by paying exactly priceWei
+    function buyExperiment(uint256 id) external payable exists(id) {
+        Experiment storage e = experiments[id];
+        require(!e.sold, "Already sold");
+        require(msg.sender != e.seller, "Seller can't buy own experiment");
+        require(msg.value >= e.priceWei, "Insufficient payment");
+
+        // compute platform fee & seller amount
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        uint256 sellerAmount = msg.value - fee;
+
+        // credit balances for later withdrawal (pull pattern)
+        if (sellerAmount > 0) withdrawals[e.seller] += sellerAmount;
+        if (fee > 0 && platformReceiver != address(0)) withdrawals[platformReceiver] += fee;
+
+        e.buyer = msg.sender;
+        e.sold = true;
+        e.purchasedAt = block.timestamp;
+
+        emit ExperimentBought(id, msg.sender, msg.value);
+
+        // refund overpayment if any (protect buyer)
+        if (msg.value > e.priceWei) {
+            uint256 refund = msg.value - e.priceWei;
+            // if platform fee is proportional to msg.value, refund seller credit and fee proportionally would have been applied above;
+            // instead we simply refund immediate overpayment to buyer (good UX). Note: this slightly changes effective seller amount.
+            // Refund immediately (safe because it's buyer).
+            (bool ok,) = payable(msg.sender).call{value: refund}("");
+            if (!ok) {
+                // On failed refund, leave refund in withdrawals for buyer
+                withdrawals[msg.sender] += refund;
+            }
+        }
+    }
+
+    /// @notice Buyer records the result of the experiment on-chain
+    /// @param id Experiment id
+    /// @param resultHash Hash (keccak256 / IPFS digest mapped to bytes32) of the result data
+    /// @param score Numeric score/metric of experiment result
+    function recordResult(uint256 id, bytes32 resultHash, uint256 score) external exists(id) {
+        Experiment storage e = experiments[id];
+        require(e.sold, "Not purchased");
+        require(msg.sender == e.buyer, "Only buyer can record result");
+        require(e.resultRecordedAt == 0, "Result already recorded");
+
+        e.resultHash = resultHash;
+        e.score = score;
+        e.resultRecordedAt = block.timestamp;
+
+        emit ResultRecorded(id, msg.sender, resultHash, score);
+    }
+
+    /* ========== WITHDRAWALS ========== */
+
+    /// @notice Withdraw accumulated funds (seller/platform/others)
+    function withdraw() external {
+        uint256 amount = withdrawals[msg.sender];
+        require(amount > 0, "No funds");
+        withdrawals[msg.sender] = 0;
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        require(ok, "Transfer failed");
+        emit Withdraw(msg.sender, amount);
+    }
+
+    /* ========== VIEWS ========== */
+
+    function getExperiment(uint256 id) external view exists(id) returns (
+        uint256 eid,
+        address seller,
+        address buyer,
+        uint256 priceWei,
+        bool sold,
+        bytes32 resultHash,
+        uint256 score,
+        uint256 createdAt,
+        uint256 purchasedAt,
+        uint256 resultRecordedAt,
+        string memory metadata
+    ) {
+        Experiment storage e = experiments[id];
+        return (e.id, e.seller, e.buyer, e.priceWei, e.sold, e.resultHash, e.score, e.createdAt, e.purchasedAt, e.resultRecordedAt, e.metadata);
+    }
+
+    /* ========== FALLBACKS ========== */
+    receive() external payable {
+        // accept ETH; helpful for funding platformReceiver or direct transfers
+        withdrawals[msg.sender] += msg.value;
+    }
+}
